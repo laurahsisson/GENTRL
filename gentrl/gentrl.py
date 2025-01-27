@@ -1,43 +1,23 @@
+import tqdm
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from math import pi, log
 from gentrl.lp import LP
 import pickle
+from gentrl.stats import TrainStats
 
-from moses.metrics.utils import get_mol
+from rdkit import Chem
 
 
-class TrainStats():
-    def __init__(self):
-        self.stats = dict()
-
-    def update(self, delta):
-        for key in delta.keys():
-            if key in self.stats.keys():
-                self.stats[key].append(delta[key])
-            else:
-                self.stats[key] = [delta[key]]
-
-    def reset(self):
-        for key in self.stats.keys():
-            self.stats[key] = []
-
-    def print(self):
-        for key in self.stats.keys():
-            print(str(key) + ": {:4.4};".format(
-                sum(self.stats[key]) / len(self.stats[key])
-            ), end='')
-
-        print()
-
+DEFAULT_REINIT_EPOCHS = [0,1,5]
 
 class GENTRL(nn.Module):
     '''
     GENTRL model
     '''
     def __init__(self, enc, dec, latent_descr, feature_descr, tt_int=40,
-                 tt_type='usual', beta=0.01, gamma=0.1):
+                 tt_type='usual', beta=0.01, gamma=0.1, device='cuda'):
         super(GENTRL, self).__init__()
 
         self.enc = enc
@@ -57,6 +37,8 @@ class GENTRL(nn.Module):
 
         self.beta = beta
         self.gamma = gamma
+
+        self.device = device
 
     def get_elbo(self, x, y):
         means, log_stds = torch.split(self.enc.encode(x),
@@ -117,77 +99,77 @@ class GENTRL(nn.Module):
         self.dec.load_state_dict(torch.load(folder_to_load + 'dec.model'))
         self.lp.load_state_dict(torch.load(folder_to_load + 'lp.model'))
 
+    def reinit_lp(self,train_loader):
+        iter_train_loader = iter(train_loader)
+        
+        # TODO: This could just be an empty tensor?
+        buf = None
+        while (buf is None) or (buf.shape[0] < 5000):
+            x_batch, y_batch = next(iter_train_loader)
+            y_batch = y_batch.float().to(self.lp.tt_cores[0].device)
+            if len(y_batch.shape) == 1:
+                y_batch = y_batch.view(-1, 1).contiguous()
+
+
+            enc_out = self.enc.encode(x_batch)
+            means, log_stds = torch.split(enc_out,
+                                          len(self.latent_descr),
+                                          dim=1)
+            z_batch = (means + torch.randn_like(log_stds) *
+                       torch.exp(0.5 * log_stds))
+            cur_batch = torch.cat([z_batch, y_batch], dim=1)
+            if buf is None:
+                buf = cur_batch
+            else:
+                buf = torch.cat([buf, cur_batch])
+
+        descr = len(self.latent_descr) * [0]
+        descr += len(self.feature_descr) * [1]
+        self.lp.reinit_from_data(buf, descr)
+        self.lp.to(self.device)
+
     def train_as_vaelp(self, train_loader, num_epochs=10,
-                       verbose_step=50, lr=1e-3):
+                       disable_tqdm=False, lr=1e-3, reinit_epochs = None):
         optimizer = optim.Adam(self.parameters(), lr=lr)
 
         global_stats = TrainStats()
         local_stats = TrainStats()
 
         epoch_i = 0
-        to_reinit = False
-        buf = None
-        while epoch_i < num_epochs:
-            i = 0
-            if verbose_step:
-                print("Epoch", epoch_i, ":")
+        reinit_epochs = DEFAULT_REINIT_EPOCHS if reinit_epochs is None else reinit_epochs
 
-            if epoch_i in [0, 1, 5]:
-                to_reinit = True
+        with tqdm.tqdm(total=len(train_loader)*num_epochs, disable=disable_tqdm) as pbar:
+            while epoch_i < num_epochs:
+                i = 0
 
-            epoch_i += 1
+                if epoch_i in reinit_epochs:
+                    print("REINIT")
+                    self.reinit_lp(train_loader)
 
-            for x_batch, y_batch in train_loader:
-                if verbose_step:
-                    print("!", end='')
+                epoch_i += 1
 
-                i += 1
+                for x_batch, y_batch in train_loader:
+                    pbar.update(1)
+                    pbar.set_postfix(local_stats.display_dict())
 
-                y_batch = y_batch.float().to(self.lp.tt_cores[0].device)
-                if len(y_batch.shape) == 1:
-                    y_batch = y_batch.view(-1, 1).contiguous()
+                    i += 1
 
-                if to_reinit:
-                    if (buf is None) or (buf.shape[0] < 5000):
-                        enc_out = self.enc.encode(x_batch)
-                        means, log_stds = torch.split(enc_out,
-                                                      len(self.latent_descr),
-                                                      dim=1)
-                        z_batch = (means + torch.randn_like(log_stds) *
-                                   torch.exp(0.5 * log_stds))
-                        cur_batch = torch.cat([z_batch, y_batch], dim=1)
-                        if buf is None:
-                            buf = cur_batch
-                        else:
-                            buf = torch.cat([buf, cur_batch])
-                    else:
-                        descr = len(self.latent_descr) * [0]
-                        descr += len(self.feature_descr) * [1]
-                        self.lp.reinit_from_data(buf, descr)
-                        self.lp.cuda()
-                        buf = None
-                        to_reinit = False
+                    y_batch = y_batch.float().to(self.lp.tt_cores[0].device)
+                    if len(y_batch.shape) == 1:
+                        y_batch = y_batch.view(-1, 1).contiguous()
 
-                    continue
+                    elbo, cur_stats = self.get_elbo(x_batch, y_batch)
+                    local_stats.update(cur_stats)
+                    global_stats.update(cur_stats)
 
-                elbo, cur_stats = self.get_elbo(x_batch, y_batch)
-                local_stats.update(cur_stats)
-                global_stats.update(cur_stats)
+                    optimizer.zero_grad()
+                    loss = -elbo
+                    loss.backward()
+                    optimizer.step()
 
-                optimizer.zero_grad()
-                loss = -elbo
-                loss.backward()
-                optimizer.step()
-
-                if verbose_step and i % verbose_step == 0:
-                    local_stats.print()
+                epoch_i += 1
+                if i > 0:
                     local_stats.reset()
-                    i = 0
-
-            epoch_i += 1
-            if i > 0:
-                local_stats.print()
-                local_stats.reset()
 
         return global_stats
 
@@ -236,7 +218,7 @@ class GENTRL(nn.Module):
             optimizer_dec.step()
             optimizer_lp.step()
 
-            valid_sm = [s for s in smiles if get_mol(s) is not None]
+            valid_sm = [s for s in smiles if Chem.MolFromSmiles(s) is not None]
             cur_stats = {'mean_reward': sum(r_list) / len(smiles),
                          'valid_perc': len(valid_sm) / len(smiles)}
 

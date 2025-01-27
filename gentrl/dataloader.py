@@ -46,7 +46,7 @@ class MolecularDataset(Dataset):
             self.len = max(self.len,
                            int(len(cur_smiles) / source_descr['prob']))
 
-        self.source_probs = np.array(self.source_probs).astype(np.float)
+        self.source_probs = np.array(self.source_probs).astype(np.float32)
 
         self.source_probs /= self.source_probs.sum()
 
